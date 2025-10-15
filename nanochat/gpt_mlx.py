@@ -302,10 +302,12 @@ class GPT(nn.Module):
 
             if top_k is not None:
                 # Top-k filtering
-                vals, idx = mx.top_k(logits, min(top_k, logits.shape[-1]))
-                logits_filtered = mx.full(logits.shape, -float('inf'))
-                logits_filtered = mx.scatter(logits_filtered, idx, vals, axes=[1])
-                logits = logits_filtered
+                # MLX topk only returns values, so we use argpartition
+                k = min(top_k, logits.shape[-1])
+                top_vals = mx.topk(logits, k)
+                # Set logits below the k-th largest value to -inf
+                threshold = mx.min(top_vals, axis=-1, keepdims=True)
+                logits = mx.where(logits >= threshold, logits, -float('inf'))
 
             if temperature > 0:
                 logits = logits / temperature
