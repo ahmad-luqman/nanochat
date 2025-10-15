@@ -17,8 +17,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nanochat.gpt_mlx import GPT, GPTConfig
 from nanochat.optimizers_mlx import AdamW, Muon
-from nanochat.data_mlx import SyntheticDataLoader
+from nanochat.data_mlx import SyntheticDataLoader, TextDataLoader
 from nanochat.common_mlx import print0
+from nanochat.checkpoint_mlx import save_checkpoint, load_checkpoint, get_latest_checkpoint
+from nanochat.lr_scheduler_mlx import CosineAnnealingLR
+from nanochat.metrics_mlx import validate, compute_bpb, load_token_bytes, MetricsLogger, print_metrics_summary
 
 
 def create_model(model_size='d6'):
@@ -27,6 +30,8 @@ def create_model(model_size='d6'):
         'd2': GPTConfig(sequence_len=256, vocab_size=2048, n_layer=2, n_head=4, n_kv_head=4, n_embd=128),
         'd6': GPTConfig(sequence_len=512, vocab_size=4096, n_layer=6, n_head=6, n_kv_head=6, n_embd=384),
         'd10': GPTConfig(sequence_len=1024, vocab_size=8192, n_layer=10, n_head=8, n_kv_head=8, n_embd=512),
+        'd14': GPTConfig(sequence_len=1024, vocab_size=65536, n_layer=14, n_head=12, n_kv_head=12, n_embd=768),
+        'd20': GPTConfig(sequence_len=1024, vocab_size=65536, n_layer=20, n_head=16, n_kv_head=16, n_embd=1024),
     }
 
     if model_size not in configs:
@@ -140,13 +145,20 @@ def train(
     weight_decay=0.0,
     use_muon=False,
     log_interval=10,
-    eval_interval=100,
+    eval_interval=500,
+    val_batches=100,
+    use_real_data=False,
+    checkpoint_dir=None,
+    save_interval=1000,
+    resume_from=None,
+    warmup_steps=0,
+    min_lr_ratio=0.1,
 ):
     """
     Main training loop
 
     Args:
-        model_size: Model size (d2, d6, d10)
+        model_size: Model size (d2, d6, d10, d14, d20)
         batch_size: Batch size
         seq_len: Sequence length
         max_steps: Maximum training steps
@@ -154,15 +166,39 @@ def train(
         weight_decay: Weight decay
         use_muon: Whether to use Muon optimizer for 2D params
         log_interval: Steps between logging
-        eval_interval: Steps between evaluation
+        eval_interval: Steps between validation (default: 500)
+        val_batches: Number of validation batches to run (default: 100)
+        use_real_data: Use real data from parquet files instead of synthetic
+        checkpoint_dir: Directory to save checkpoints (None = no saving)
+        save_interval: Steps between checkpoint saves
+        resume_from: Path to checkpoint to resume from (None = fresh start)
+        warmup_steps: Number of warmup steps for LR schedule (0 = no warmup)
+        min_lr_ratio: Minimum LR as fraction of max LR (for cosine annealing)
     """
     print0("=" * 70)
     print0("MLX Training - nanochat")
     print0("=" * 70)
 
-    # Create model
-    print0(f"\nInitializing {model_size} model...")
-    model, config = create_model(model_size)
+    # Resume from checkpoint if specified
+    start_step = 0
+    if resume_from:
+        print0(f"\nResuming from checkpoint: {resume_from}")
+        # Load config first to create model
+        import json
+        meta_path = resume_from + ".meta.json"
+        with open(meta_path, "r") as f:
+            metadata = json.load(f)
+
+        # Create model with config from checkpoint
+        config_dict = metadata['model_config']
+        config = GPTConfig(**config_dict)
+        model = GPT(config)
+        start_step = metadata['step']
+        print0(f"  Resuming from step {start_step}")
+    else:
+        # Create model from scratch
+        print0(f"\nInitializing {model_size} model...")
+        model, config = create_model(model_size)
 
     # Count parameters
     def count_params(tree):
@@ -211,28 +247,114 @@ def train(
     else:
         print0(f"  Using AdamW for all parameters")
 
+    # Create LR scheduler
+    scheduler = None
+    if warmup_steps > 0:
+        print0(f"\nSetting up LR scheduler...")
+        print0(f"  Schedule: Cosine annealing with warmup")
+        print0(f"  Warmup steps: {warmup_steps}")
+        print0(f"  Max LR: {scaled_lr:.6f}")
+        print0(f"  Min LR: {scaled_lr * min_lr_ratio:.6f}")
+
+        optimizer_for_scheduler = muon if use_muon else adamw
+        scheduler = CosineAnnealingLR(
+            optimizer=optimizer_for_scheduler,
+            warmup_steps=warmup_steps,
+            max_steps=max_steps,
+            max_lr=scaled_lr,
+            min_lr_ratio=min_lr_ratio
+        )
+    else:
+        print0(f"  No LR scheduling (constant LR)")
+
+    # Load checkpoint weights and optimizer state if resuming
+    if resume_from:
+        optimizer = muon if use_muon else adamw
+        model, optimizer, metadata = load_checkpoint(resume_from, model=model, optimizer=optimizer)
+        if use_muon:
+            muon = optimizer
+        else:
+            adamw = optimizer
+
+        # Load scheduler state if it exists
+        if scheduler and 'scheduler_state' in metadata:
+            scheduler.load_state_dict(metadata['scheduler_state'])
+            print0(f"  ✅ Loaded scheduler state (current LR: {scheduler.get_lr():.6f})")
+
     # Create data loader
     print0(f"\nSetting up data loader...")
     print0(f"  Batch size: {batch_size}")
     print0(f"  Sequence length: {seq_len}")
-    print0(f"  Vocab size: {config.vocab_size}")
+    print0(f"  Data source: {'Real (FineWebEdu)' if use_real_data else 'Synthetic'}")
 
-    num_batches_per_epoch = 100
-    dataloader = SyntheticDataLoader(
-        vocab_size=config.vocab_size,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        num_batches=num_batches_per_epoch
-    )
+    if use_real_data:
+        dataloader = TextDataLoader(
+            split="train",
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+        print0(f"  Vocab size: {dataloader.vocab_size}")
+        # Update model vocab size to match tokenizer
+        if config.vocab_size != dataloader.vocab_size:
+            print0(f"  ⚠️  Model vocab ({config.vocab_size}) != tokenizer vocab ({dataloader.vocab_size})")
+            print0(f"  Reinitializing model with correct vocab size...")
+            config.vocab_size = dataloader.vocab_size
+            model = GPT(config)
+            model.init_weights()
+            nparams = count_params(model.parameters())
+            print0(f"  Updated model parameters: {nparams:,} ({nparams/1e6:.2f}M)")
+
+        # Create validation loader
+        val_loader = TextDataLoader(
+            split="val",
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+        print0(f"  Validation batches per eval: {val_batches}")
+    else:
+        print0(f"  Vocab size: {config.vocab_size}")
+        num_batches_per_epoch = 100
+        dataloader = SyntheticDataLoader(
+            vocab_size=config.vocab_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_batches=num_batches_per_epoch
+        )
+        # Create synthetic validation loader
+        val_loader = SyntheticDataLoader(
+            vocab_size=config.vocab_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_batches=val_batches
+        )
+
+    # Initialize metrics logger
+    metrics_log_file = os.path.join(checkpoint_dir, "metrics.json") if checkpoint_dir else "metrics.json"
+    metrics_logger = MetricsLogger(metrics_log_file)
+    print0(f"  Metrics will be logged to: {metrics_log_file}")
+
+    # Load token_bytes for BPB calculation
+    token_bytes = None
+    if use_real_data:
+        token_bytes = load_token_bytes()
+        if token_bytes is not None:
+            print0(f"  ✅ Loaded token_bytes for BPB calculation")
 
     # Training loop
     print0("\n" + "=" * 70)
     print0("Starting training...")
     print0("=" * 70)
 
-    step = 0
+    # Checkpoint setup
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        print0(f"Checkpoints will be saved to: {checkpoint_dir}")
+        print0(f"Save interval: {save_interval} steps")
+
+    step = start_step
     epoch = 0
     running_loss = 0.0
+    best_loss = float('inf')
     start_time = time.time()
 
     while step < max_steps:
@@ -247,6 +369,11 @@ def train(
             mx.eval(loss)
             step_time = time.time() - step_start
 
+            # Update learning rate
+            current_lr = scaled_lr
+            if scheduler:
+                current_lr = scheduler.step()
+
             running_loss += loss.item()
 
             # Logging
@@ -258,6 +385,7 @@ def train(
 
                 print0(f"Step {step:4d} | "
                       f"Loss: {avg_loss:.4f} | "
+                      f"LR: {current_lr:.6f} | "
                       f"Time: {step_time*1000:.1f}ms | "
                       f"Tok/s: {tokens_per_sec:.0f} | "
                       f"MFU: {mfu:.2f}% | "
@@ -265,9 +393,68 @@ def train(
 
                 running_loss = 0.0
 
+            # Validation
+            val_loss = None
+            bpb = None
+            if step % eval_interval == 0:
+                print0(f"\n{'='*70}")
+                print0(f"Running validation at step {step}...")
+                val_start = time.time()
+                val_loss = validate(model, val_loader, num_batches=val_batches)
+                val_time = time.time() - val_start
+                print0(f"Validation loss: {val_loss:.4f} (took {val_time:.1f}s)")
+
+                # Compute BPB
+                bpb = compute_bpb(val_loss, token_bytes)
+                print0(f"Bits per byte (BPB): {bpb:.4f}")
+                print0(f"{'='*70}\n")
+
+                # Log metrics
+                metrics_logger.log(
+                    step=step,
+                    train_loss=avg_loss if step % log_interval == 0 else None,
+                    val_loss=val_loss,
+                    bpb=bpb,
+                    lr=current_lr
+                )
+
+            # Save checkpoint
+            if checkpoint_dir and step % save_interval == 0:
+                checkpoint_path = os.path.join(checkpoint_dir, f"step_{step}.npz")
+                optimizer = muon if use_muon else adamw
+
+                # Prepare metadata with scheduler state
+                meta = {}
+                if scheduler:
+                    meta['scheduler_state'] = scheduler.state_dict()
+                    meta['current_lr'] = current_lr
+
+                save_checkpoint(model, optimizer, step, loss.item(), checkpoint_path, metadata=meta)
+
+            # Save best checkpoint based on validation loss (if available)
+            if checkpoint_dir and val_loss is not None and val_loss < best_loss:
+                best_loss = val_loss
+                best_path = os.path.join(checkpoint_dir, "best.npz")
+                optimizer = muon if use_muon else adamw
+                best_meta = {"best_val_loss": best_loss, "best_bpb": bpb}
+                if scheduler:
+                    best_meta['scheduler_state'] = scheduler.state_dict()
+                    best_meta['current_lr'] = current_lr
+                save_checkpoint(model, optimizer, step, val_loss, best_path, metadata=best_meta)
+                print0(f"  🌟 New best checkpoint saved! Val loss: {best_loss:.4f}, BPB: {bpb:.4f}")
+
             # Stop if max steps reached
             if step >= max_steps:
                 break
+
+    # Final checkpoint
+    if checkpoint_dir:
+        final_path = os.path.join(checkpoint_dir, f"final_step_{step}.npz")
+        optimizer = muon if use_muon else adamw
+        final_meta = {"final": True}
+        if scheduler:
+            final_meta['scheduler_state'] = scheduler.state_dict()
+        save_checkpoint(model, optimizer, step, loss.item(), final_path, metadata=final_meta)
 
     # Final summary
     total_time = time.time() - start_time
@@ -276,7 +463,10 @@ def train(
     print0("=" * 70)
     print0(f"Total steps: {step}")
     print0(f"Total time: {total_time:.1f}s")
-    print0(f"Avg time per step: {total_time/step*1000:.1f}ms")
+    print0(f"Avg time per step: {total_time/(step-start_step)*1000:.1f}ms")
+    if checkpoint_dir:
+        print0(f"Checkpoints saved to: {checkpoint_dir}")
+        print0(f"Best loss: {best_loss:.4f}")
 
     return model
 
@@ -285,8 +475,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Train nanochat model on MLX")
-    parser.add_argument("--model-size", type=str, default="d6", choices=['d2', 'd6', 'd10'],
-                       help="Model size (d2, d6, d10)")
+    parser.add_argument("--model-size", type=str, default="d6", choices=['d2', 'd6', 'd10', 'd14', 'd20'],
+                       help="Model size (d2, d6, d10, d14, d20)")
     parser.add_argument("--batch-size", type=int, default=8,
                        help="Batch size")
     parser.add_argument("--seq-len", type=int, default=128,
@@ -299,8 +489,24 @@ if __name__ == "__main__":
                        help="Weight decay")
     parser.add_argument("--use-muon", action="store_true",
                        help="Use Muon optimizer for 2D parameters")
+    parser.add_argument("--use-real-data", action="store_true",
+                       help="Use real data from parquet files (FineWebEdu)")
     parser.add_argument("--log-interval", type=int, default=10,
                        help="Steps between logging")
+    parser.add_argument("--eval-interval", type=int, default=500,
+                       help="Steps between validation (default: 500)")
+    parser.add_argument("--val-batches", type=int, default=100,
+                       help="Number of validation batches to run (default: 100)")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                       help="Directory to save checkpoints (default: no saving)")
+    parser.add_argument("--save-interval", type=int, default=1000,
+                       help="Steps between checkpoint saves (default: 1000)")
+    parser.add_argument("--resume-from", type=str, default=None,
+                       help="Path to checkpoint to resume from (default: fresh start)")
+    parser.add_argument("--warmup-steps", type=int, default=0,
+                       help="Number of warmup steps for LR schedule (default: 0 = no warmup)")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1,
+                       help="Minimum LR as fraction of max LR (default: 0.1)")
 
     args = parser.parse_args()
 
@@ -313,5 +519,13 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         use_muon=args.use_muon,
+        use_real_data=args.use_real_data,
         log_interval=args.log_interval,
+        eval_interval=args.eval_interval,
+        val_batches=args.val_batches,
+        checkpoint_dir=args.checkpoint_dir,
+        save_interval=args.save_interval,
+        resume_from=args.resume_from,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
     )
