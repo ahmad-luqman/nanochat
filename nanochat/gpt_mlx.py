@@ -229,8 +229,20 @@ class GPT(nn.Module):
 
     def estimate_flops(self):
         """Return the estimated FLOPs per token for the model"""
-        # Count parameters
-        nparams = sum(p.size for p in self.parameters().values())
+        # Count parameters recursively
+        def count_params(tree):
+            total = 0
+            if isinstance(tree, dict):
+                for v in tree.values():
+                    total += count_params(v)
+            elif isinstance(tree, list):
+                for v in tree:
+                    total += count_params(v)
+            elif hasattr(tree, 'size'):
+                total += tree.size
+            return total
+
+        nparams = count_params(self.parameters())
         nparams_embedding = self.wte.weight.size
         l, h, q, t = self.config.n_layer, self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
