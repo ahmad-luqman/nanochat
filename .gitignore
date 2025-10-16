@@ -17,3 +17,9 @@ sft_*.log
 debug_*.py
 test_comparison.sh
 check_training_data.py
+
+# Exercise outputs (for learning, not for git)
+exercises/my_first_model/
+exercises/test_sft/
+exercises/*.npz
+exercises/*.json
