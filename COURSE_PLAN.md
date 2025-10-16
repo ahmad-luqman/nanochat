@@ -1849,17 +1849,44 @@ By the end of this course, you should be able to:
 
 ---
 
+## 📊 Diagrams
+
+Visual diagrams are available in the `diagrams/` directory:
+
+1. **Architecture Diagram** (`diagrams/architecture.md`)
+   - Model layers and data flow
+   - Embedding → Transformer → Output head
+   - Component breakdown with dimensions
+
+2. **Attention Mechanism** (`diagrams/attention.md`)
+   - Query/Key/Value visualization
+   - Multi-head attention
+   - Causal masking for autoregressive generation
+
+3. **Data Flow** (`diagrams/data_flow.md`)
+   - Text → Tokenization → Model → Generation
+   - Training pipeline flow
+   - Forward and backward passes
+
+4. **Training Pipeline** (`diagrams/training_pipeline.md`)
+   - Pretraining → SFT → Inference
+   - Data processing and loss computation
+   - Checkpointing and evaluation
+
+See the `diagrams/` directory for detailed visual explanations.
+
+---
+
 ## 📝 Notes for Course Developers
 
 When creating the full course from this plan:
 
-1. **Add Visuals**: Diagrams for architecture, data flow, attention mechanism
-2. **Video Walkthroughs**: Record yourself running the exercises
-3. **Interactive Notebooks**: Convert exercises to Jupyter notebooks
-4. **Automated Grading**: Create tests for exercises
-5. **Discussion Forums**: Set up Q&A for students
-6. **Office Hours**: Live sessions for difficult topics
-7. **Capstone Project**: Guided final project with milestones
+1. **Use Diagrams**: All diagrams are in `diagrams/` directory (Mermaid format)
+2. **Interactive Notebooks**: Convert exercises to Jupyter notebooks (optional)
+3. **Automated Grading**: Create tests for exercises
+4. **Discussion Forums**: Set up Q&A for students
+5. **Office Hours**: Live sessions for difficult topics (optional)
+6. **Capstone Project**: Guided final project with milestones
 
 ---
 
