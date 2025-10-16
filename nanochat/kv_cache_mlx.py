@@ -87,7 +87,7 @@ class KVCache:
         # 4) update the pos
         self.pos = other.pos
 
-    def insert_kv(self, layer_idx, k, v):
+    def insert_kv(self, layer_idx, k, v, debug=False):
         """
         Insert new key/value tensors into the cache and return full cache view.
 
@@ -95,6 +95,7 @@ class KVCache:
             layer_idx: Layer index (0-indexed)
             k: Key tensor of shape (B, H, T_add, D)
             v: Value tensor of shape (B, H, T_add, D)
+            debug: If True, print debug information
 
         Returns:
             key_view: Full cached keys up to current position (B, H, T_total, D)
@@ -107,6 +108,10 @@ class KVCache:
         # Insert new keys/values to the cache and return the full cache so far
         B, H, T_add, D = k.shape
         t0, t1 = self.pos, self.pos + T_add
+
+        if debug and layer_idx == 0:
+            print(f"  [Layer {layer_idx}] pos={self.pos}, t0={t0}, t1={t1}, T_add={T_add}")
+            print(f"  [Layer {layer_idx}] k.shape={k.shape}, cache.shape={self.kv_cache.shape}")
 
         # Dynamically grow the cache if needed
         if t1 > self.kv_cache.shape[4]:
@@ -135,6 +140,12 @@ class KVCache:
 
         # Update with new k, v at position t0:t1
         # Build updated arrays by concatenating parts
+        if debug and layer_idx == 0:
+            print(f"  [Layer {layer_idx}] Concatenating: [:, :, :{t0}, :] + k + [:, :, {t1}:, :]")
+            print(f"  [Layer {layer_idx}] layer_k[:,:,:t0,:].shape = {layer_k[:, :, :t0, :].shape}")
+            print(f"  [Layer {layer_idx}] k.shape = {k.shape}")
+            print(f"  [Layer {layer_idx}] layer_k[:,:,t1:,:].shape = {layer_k[:, :, t1:, :].shape}")
+
         updated_k = mx.concatenate([
             layer_k[:, :, :t0, :],
             k,
@@ -145,6 +156,9 @@ class KVCache:
             v,
             layer_v[:, :, t1:, :]
         ], axis=2)
+
+        if debug and layer_idx == 0:
+            print(f"  [Layer {layer_idx}] updated_k.shape = {updated_k.shape}")
 
         # Rebuild the cache with updated layer
         # Create list of layers
@@ -163,6 +177,9 @@ class KVCache:
         # Return the full cached keys/values up to current position (as a slice)
         key_view = self.kv_cache[layer_idx, 0, :, :, :t1, :]
         value_view = self.kv_cache[layer_idx, 1, :, :, :t1, :]
+
+        if debug and layer_idx == 0:
+            print(f"  [Layer {layer_idx}] Returning key_view.shape = {key_view.shape}")
 
         # Increment pos after the last layer of the Transformer processes
         if layer_idx == self.kv_cache.shape[0] - 1:

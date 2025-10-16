@@ -111,10 +111,8 @@ class CausalSelfAttention(nn.Module):
 
         # Attention: queries attend to keys/values autoregressively
         if kv_cache is None or Tq == Tk:
-            # During training (no KV cache), attend as usual with causal attention
-            # MLX has mx.fast.scaled_dot_product_attention
-            mask = mx.triu(mx.ones((Tq, Tk), dtype=mx.bool_), k=1)  # upper triangular = True
-            y = mx.fast.scaled_dot_product_attention(q, k, v, mask=mask, scale=1.0 / math.sqrt(self.head_dim))
+            # During training (no KV cache) or full prefill, use built-in causal mask
+            y = mx.fast.scaled_dot_product_attention(q, k, v, mask="causal", scale=1.0 / math.sqrt(self.head_dim))
         elif Tq == 1:
             # During inference but with a single query
             y = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(self.head_dim))

@@ -43,7 +43,7 @@ def create_model(model_size='d6', vocab_size=None):
     return model, config
 
 
-def generate_tokens(model, tokenizer, prompt_tokens, max_tokens=256, temperature=0.8, top_k=50, kv_cache=None):
+def generate_tokens(model, tokenizer, prompt_tokens, max_tokens=256, temperature=0.8, top_k=50, repetition_penalty=1.2, kv_cache=None):
     """
     Generate tokens autoregressively using the model with KV cache for efficiency
 
@@ -54,6 +54,7 @@ def generate_tokens(model, tokenizer, prompt_tokens, max_tokens=256, temperature
         max_tokens: Maximum tokens to generate
         temperature: Sampling temperature
         top_k: Top-k sampling parameter
+        repetition_penalty: Penalty for repeating tokens (1.0 = no penalty, >1.0 = discourage repetition)
         kv_cache: Optional KVCache object to use (if None, creates new one)
 
     Yields:
@@ -78,8 +79,27 @@ def generate_tokens(model, tokenizer, prompt_tokens, max_tokens=256, temperature
     # Get logits for last position to start generation
     next_token_logits = logits[0, -1, :]  # Shape: (vocab_size,)
 
+    # Track generated tokens for repetition penalty (only track recent ones)
+    generated_tokens = []
+    repetition_window = 50  # Only penalize tokens from last 50 generations
+
     # Generate tokens one at a time
     for _ in range(max_tokens):
+        # Apply repetition penalty
+        if repetition_penalty != 1.0 and len(generated_tokens) > 0:
+            # Only penalize recent tokens (last repetition_window tokens)
+            recent_tokens = generated_tokens[-repetition_window:]
+            logits_array = next_token_logits.tolist()
+
+            for token_id in set(recent_tokens):
+                # Apply penalty: divide logit by penalty if positive, multiply if negative
+                if logits_array[token_id] > 0:
+                    logits_array[token_id] = logits_array[token_id] / repetition_penalty
+                else:
+                    logits_array[token_id] = logits_array[token_id] * repetition_penalty
+
+            next_token_logits = mx.array(logits_array)
+
         # Apply temperature
         if temperature > 0:
             next_token_logits = next_token_logits / temperature
@@ -95,12 +115,14 @@ def generate_tokens(model, tokenizer, prompt_tokens, max_tokens=256, temperature
                 mx.array(-float('inf'))
             )
 
-        # Sample from distribution
-        probs = mx.softmax(next_token_logits, axis=-1)
-        next_token = mx.random.categorical(mx.log(probs + 1e-10))
+        # Sample from distribution (categorical expects logits, not probs)
+        next_token = mx.random.categorical(next_token_logits)
 
         # Convert to Python int
         next_token_id = int(next_token.item())
+
+        # Track this token for repetition penalty
+        generated_tokens.append(next_token_id)
 
         # Yield the token
         yield next_token_id
@@ -123,10 +145,14 @@ def main():
                        help='Sampling temperature')
     parser.add_argument('-k', '--top-k', type=int, default=50,
                        help='Top-k sampling parameter')
+    parser.add_argument('--repetition-penalty', type=float, default=1.2,
+                       help='Repetition penalty (1.0 = no penalty, >1.0 = discourage repetition)')
     parser.add_argument('--max-tokens', type=int, default=256,
                        help='Maximum tokens to generate')
     parser.add_argument('-p', '--prompt', type=str, default='',
                        help='Single prompt mode (non-interactive)')
+    parser.add_argument('--mode', type=str, default='plain', choices=['plain', 'chat'],
+                       help='Inference mode: plain (base model) or chat (SFT model)')
 
     args = parser.parse_args()
 
@@ -170,12 +196,16 @@ def main():
     assistant_end = tokenizer.encode_special("<|assistant_end|>")
 
     print("\n" + "=" * 60)
-    print("NanoChat MLX Interactive Mode")
+    print(f"NanoChat MLX - {args.mode.upper()} Mode")
     print("=" * 60)
     print("Commands:")
     print("  'quit' or 'exit' - End conversation")
     print("  'clear' - Start new conversation")
     print("=" * 60)
+    if args.mode == 'plain':
+        print("📝 Plain text mode (for base pretrained models)")
+    else:
+        print("💬 Chat mode (for SFT models)")
     print("✨ Using KV cache for fast generation!")
     print("=" * 60)
 
@@ -194,31 +224,34 @@ def main():
     # Single prompt mode
     if args.prompt:
         user_input = args.prompt
-        print(f"\nUser: {user_input}")
+        print(f"\n{'User' if args.mode == 'chat' else 'Prompt'}: {user_input}")
 
-        # Add user message
-        conversation_tokens.append(user_start)
-        conversation_tokens.extend(tokenizer.encode(user_input))
-        conversation_tokens.append(user_end)
+        if args.mode == 'chat':
+            # Chat mode: use special tokens
+            conversation_tokens.append(user_start)
+            conversation_tokens.extend(tokenizer.encode(user_input))
+            conversation_tokens.append(user_end)
+            conversation_tokens.append(assistant_start)
+        else:
+            # Plain mode: just encode the text directly
+            conversation_tokens = tokenizer.encode(user_input)
 
-        # Start assistant response
-        conversation_tokens.append(assistant_start)
-
-        print("\nAssistant: ", end="", flush=True)
+        print(f"\n{'Assistant' if args.mode == 'chat' else 'Generated'}: ", end="", flush=True)
         response_tokens = []
         for token_id in generate_tokens(
             model, tokenizer, conversation_tokens,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty,
             kv_cache=kv_cache
         ):
             response_tokens.append(token_id)
             token_text = tokenizer.decode([token_id])
             print(token_text, end="", flush=True)
 
-            # Stop if we hit assistant_end
-            if token_id == assistant_end:
+            # Stop if we hit assistant_end (only in chat mode)
+            if args.mode == 'chat' and token_id == assistant_end:
                 break
 
         print("\n")
@@ -227,7 +260,8 @@ def main():
     # Interactive mode
     while True:
         try:
-            user_input = input("\nUser: ").strip()
+            prompt_label = "User" if args.mode == 'chat' else "Prompt"
+            user_input = input(f"\n{prompt_label}: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye!")
             break
@@ -238,7 +272,7 @@ def main():
             break
 
         if user_input.lower() == 'clear':
-            conversation_tokens = [bos]
+            conversation_tokens = [bos] if args.mode == 'chat' else []
             kv_cache.reset()  # Reset the KV cache
             print("Conversation cleared (KV cache reset).")
             continue
@@ -246,34 +280,43 @@ def main():
         if not user_input:
             continue
 
-        # Add user message
-        conversation_tokens.append(user_start)
-        conversation_tokens.extend(tokenizer.encode(user_input))
-        conversation_tokens.append(user_end)
+        if args.mode == 'chat':
+            # Chat mode: use special tokens
+            conversation_tokens.append(user_start)
+            conversation_tokens.extend(tokenizer.encode(user_input))
+            conversation_tokens.append(user_end)
+            conversation_tokens.append(assistant_start)
+        else:
+            # Plain mode: just encode the text directly
+            # For interactive, append to existing tokens to maintain context
+            if conversation_tokens:
+                conversation_tokens.extend(tokenizer.encode(" " + user_input))
+            else:
+                conversation_tokens = tokenizer.encode(user_input)
 
-        # Start assistant response
-        conversation_tokens.append(assistant_start)
-
-        print("\nAssistant: ", end="", flush=True)
+        response_label = "Assistant" if args.mode == 'chat' else "Generated"
+        print(f"\n{response_label}: ", end="", flush=True)
         response_tokens = []
         for token_id in generate_tokens(
             model, tokenizer, conversation_tokens,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty,
             kv_cache=kv_cache
         ):
             response_tokens.append(token_id)
             token_text = tokenizer.decode([token_id])
             print(token_text, end="", flush=True)
 
-            # Stop if we hit assistant_end
-            if token_id == assistant_end:
+            # Stop if we hit assistant_end (only in chat mode)
+            if args.mode == 'chat' and token_id == assistant_end:
                 break
 
-        # Ensure assistant_end is at the end
-        if response_tokens and response_tokens[-1] != assistant_end:
-            response_tokens.append(assistant_end)
+        # Ensure assistant_end is at the end (only in chat mode)
+        if args.mode == 'chat':
+            if response_tokens and response_tokens[-1] != assistant_end:
+                response_tokens.append(assistant_end)
 
         conversation_tokens.extend(response_tokens)
         print()
