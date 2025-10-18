@@ -3,3 +3,17 @@ __pycache__/
 *.pyc
 rustbpe/target/
 dev-ignore/
+
+# Model checkpoints (too large for git)
+checkpoints/
+
+# Training and debug logs
+*.log
+data_download.log
+training_*.log
+sft_*.log
+
+# Temporary debug/test scripts (not for production)
+debug_*.py
+test_comparison.sh
+check_training_data.py
